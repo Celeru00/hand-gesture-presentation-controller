@@ -91,6 +91,10 @@ class ControllerConfig:
     # Prevents the mouse from staying held down forever in draw mode.
     draw_release_timeout_seconds: float = 0.25
 
+    # If no pointer/draw event arrives for this long, automatically press
+    # Esc to turn off PowerPoint's laser/pen mode.
+    pointer_idle_timeout_seconds: float = 0.5
+
     # Optional. If installed:
     #   pip install pygetwindow
     # You can set target_window_title_keyword="PowerPoint"
@@ -220,6 +224,10 @@ class PowerPointActionDriver:
         self._mouse_is_down = False
         self._last_draw_event_at = 0.0
         self._last_pointer_xy: Optional[tuple[int, int]] = None
+        # PowerPoint's laser (Ctrl+L) and pen (Ctrl+P) are sticky toggles.
+        # Track which mode is currently on so we toggle off before leaving.
+        self._active_pointer_mode: Optional[str] = None  # "laser" | "pen" | None
+        self._last_pointer_event_at = 0.0
 
         if pyautogui is not None:
             pyautogui.FAILSAFE = True
@@ -250,9 +258,11 @@ class PowerPointActionDriver:
             self._try_focus_target_window()
 
         if gesture in POINTER_GESTURES:
+            self._last_pointer_event_at = time.time()
             return self._handle_pointer_gesture(gesture, event)
 
-        # Any discrete action stops drawing first.
+        # Non-pointer gesture: exit any active laser/pen mode and stop drawing.
+        self._exit_pointer_mode_if_any()
         self.release_draw_if_needed(force=True)
 
         now = time.time()
@@ -278,19 +288,19 @@ class PowerPointActionDriver:
 
         if gesture == STOP_EXIT:
             pyautogui.press("esc")
-            return "Sent Escape: exit slideshow."
+            return "Sent Esc: exit slideshow."
 
         if gesture == BLANK_SCREEN:
             pyautogui.press("b")
-            return "Sent B: blank/unblank screen."
+            return "Sent B: blank / unblank screen."
 
         if gesture == ZOOM_IN:
-            pyautogui.hotkey("ctrl", "+")
-            return "Sent Ctrl +: zoom in."
+            pyautogui.hotkey("ctrl", "=")
+            return "Sent Ctrl + = : zoom in."
 
         if gesture == ZOOM_OUT:
             pyautogui.hotkey("ctrl", "-")
-            return "Sent Ctrl -: zoom out."
+            return "Sent Ctrl + - : zoom out."
 
         return f"No action configured for {label}."
 
@@ -310,8 +320,18 @@ class PowerPointActionDriver:
             self._mouse_is_down = False
 
     def _handle_pointer_gesture(self, gesture: str, event: GestureEvent) -> str:
-        coords = self._get_event_cursor(event)
+        target_mode = "laser" if gesture == LASER_POINTER else "pen"
         label = GESTURE_LABELS[gesture]
+
+        # PowerPoint laser (Ctrl+L) and pen (Ctrl+P) are sticky toggles.
+        # If we're not in the right mode yet, send the shortcut once.
+        if self._active_pointer_mode != target_mode:
+            if self._active_pointer_mode is not None:
+                # Switching modes: turn the previous one off first.
+                self._exit_pointer_mode_if_any()
+            self._enter_pointer_mode(target_mode)
+
+        coords = self._get_event_cursor(event)
 
         if coords is None:
             if gesture == DRAW_ANNOTATE:
@@ -323,7 +343,7 @@ class PowerPointActionDriver:
         if gesture == LASER_POINTER:
             self.release_draw_if_needed(force=True)
             pyautogui.moveTo(x, y, duration=0)
-            return f"Moved pointer to ({x}, {y})."
+            return f"Laser pointer at ({x}, {y})."
 
         if gesture == DRAW_ANNOTATE:
             if not self._mouse_is_down:
@@ -337,6 +357,41 @@ class PowerPointActionDriver:
             return f"Drawing at ({x}, {y})."
 
         return f"No pointer action configured for {label}."
+
+    def _enter_pointer_mode(self, mode: str) -> None:
+        """Toggle PowerPoint into laser or pen mode (Ctrl+L / Ctrl+P)."""
+        if pyautogui is None:
+            self._active_pointer_mode = mode
+            return
+
+        if mode == "laser":
+            pyautogui.hotkey("ctrl", "l")
+        elif mode == "pen":
+            pyautogui.hotkey("ctrl", "p")
+        else:
+            return
+
+        self._active_pointer_mode = mode
+
+    def _exit_pointer_mode_if_any(self) -> None:
+        """Turn off laser/pen mode by pressing Esc, releasing the mouse first."""
+        if self._active_pointer_mode is None:
+            return
+
+        self.release_draw_if_needed(force=True)
+        if pyautogui is not None:
+            pyautogui.press("esc")
+        self._active_pointer_mode = None
+
+    def check_pointer_idle(self) -> None:
+        """Called periodically. If pointer mode is on but no pointer events
+        have arrived recently, exit the mode so the cursor returns to normal."""
+        if self._active_pointer_mode is None:
+            return
+
+        idle = time.time() - self._last_pointer_event_at
+        if idle > self.config.pointer_idle_timeout_seconds:
+            self._exit_pointer_mode_if_any()
 
     def _get_event_cursor(self, event: GestureEvent) -> Optional[tuple[float, float]]:
         x = event.cursor_x
@@ -675,14 +730,14 @@ class PresentationControllerApp:
 
         cheat = [
             ("Open palm", "Start (F5)"),
-            ("Closed fist", "Exit (Esc)"),
+            ("Closed fist", "Exit (Esc) — hold 3s"),
             ("Thumbs up", "Blank (B)"),
-            ("Swipe right", "Next slide"),
-            ("Swipe left", "Previous slide"),
-            ("Index up", "Laser pointer"),
-            ("Peace sign", "Draw / annotate"),
-            ("Pinch open", "Zoom in"),
-            ("Pinch closed", "Zoom out"),
+            ("Swipe right", "Next slide (→)"),
+            ("Swipe left", "Prev slide (←)"),
+            ("Index up", "Laser (Ctrl+L)"),
+            ("Peace sign", "Draw (Ctrl+P)"),
+            ("Pinch open", "Zoom in (Ctrl+=)"),
+            ("Pinch closed", "Zoom out (Ctrl+-)"),
         ]
         for i, (pose, action) in enumerate(cheat):
             ttk.Label(cheat_card, text=pose, style="Hint.TLabel").grid(
@@ -758,11 +813,27 @@ class PresentationControllerApp:
             self._process_gesture_event(event)
 
         self.driver.release_draw_if_needed(force=False)
+        self.driver.check_pointer_idle()
         self.root.after(self.config.ui_poll_ms, self._poll_queues)
 
     def _process_gesture_event(self, event: GestureEvent) -> None:
         normalized = normalize_gesture_name(event.gesture_type)
         label = GESTURE_LABELS.get(normalized, event.gesture_type)
+
+        if event.metadata.get("hold_in_progress"):
+            progress = float(event.metadata.get("hold_progress", 0.0))
+            required = float(event.metadata.get("hold_required_seconds", 0.0))
+            elapsed = float(event.metadata.get("hold_elapsed_seconds", 0.0))
+
+            self.current_gesture_var.set(f"{label}  (hold)")
+            self.current_confidence_var.set(f"{int(progress * 100)}%")
+            self.confidence_percent_var.set(
+                max(0.0, min(100.0, progress * 100.0))
+            )
+            self.last_action_var.set(
+                f"Hold to confirm: {elapsed:.1f}s / {required:.1f}s"
+            )
+            return
 
         self.current_gesture_var.set(label)
         self.current_confidence_var.set(f"{event.confidence:.2f}")
@@ -934,6 +1005,7 @@ class PresentationControllerApp:
     def _on_close(self) -> None:
         self._closed = True
         self.driver.release_draw_if_needed(force=True)
+        self.driver._exit_pointer_mode_if_any()
 
         try:
             self.on_source_selected(SourceRequest(source_type="stop", value=None))

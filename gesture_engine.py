@@ -138,6 +138,15 @@ class GestureRecognitionConfig:
         }
     )
 
+    # Hold-to-confirm times. The user must keep the pose stable for this
+    # many seconds before the action fires. Prevents accidental triggers
+    # on destructive actions like exiting the slideshow.
+    hold_seconds: Dict[str, float] = field(
+        default_factory=lambda: {
+            STOP_EXIT: 3.0,
+        }
+    )
+
 
 @dataclass
 class GestureCandidate:
@@ -279,6 +288,7 @@ class GestureRecognitionEngine:
         self._unstable_frames = 0
         self._active_static_name: Optional[str] = None
         self._active_static_emitted = False
+        self._active_static_started_at: Optional[float] = None
 
         self._motion_history: Deque[Tuple[float, float, float]] = deque()
         self._last_emitted_at: Dict[str, float] = {}
@@ -780,6 +790,7 @@ class GestureRecognitionEngine:
         if stable_name != self._active_static_name:
             self._active_static_name = stable_name
             self._active_static_emitted = False
+            self._active_static_started_at = packet.timestamp
 
         # Pointer gestures need continuous events, because Person 3 moves
         # or drags the cursor based on these coordinates.
@@ -804,6 +815,29 @@ class GestureRecognitionEngine:
         if self._active_static_emitted:
             return None
 
+        # Hold-to-confirm: require the user to keep the pose stable for N
+        # seconds before firing. While holding, emit progress events so
+        # the UI can show feedback without triggering the real action.
+        required_hold = self.config.hold_seconds.get(stable_name, 0.0)
+        if required_hold > 0.0:
+            started_at = self._active_static_started_at or packet.timestamp
+            held_for = packet.timestamp - started_at
+            if held_for < required_hold:
+                progress = max(0.0, min(1.0, held_for / required_hold))
+                return GestureEvent(
+                    gesture_type=stable_name,
+                    confidence=average_confidence,
+                    timestamp=packet.timestamp,
+                    source_frame_id=packet.frame_id,
+                    metadata={
+                        **dict(latest_same.metadata),
+                        "hold_in_progress": True,
+                        "hold_progress": progress,
+                        "hold_required_seconds": required_hold,
+                        "hold_elapsed_seconds": held_for,
+                    },
+                )
+
         if not self._cooldown_ok(stable_name, packet.timestamp):
             return None
 
@@ -823,6 +857,7 @@ class GestureRecognitionEngine:
         self._unstable_frames = 0
         self._active_static_name = None
         self._active_static_emitted = False
+        self._active_static_started_at = None
         self._pointer_x_filter.reset()
         self._pointer_y_filter.reset()
 

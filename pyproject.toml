@@ -1,11 +1,13 @@
 [project]
 name = "hand-gesture-presentation-controller"
 version = "0.1.0"
-description = "Add your description here"
+description = "Real-time hand gesture recognition system for controlling Microsoft PowerPoint"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "Pillow",
     "pyautogui",
+    "opencv-python",
+    "mediapipe==0.10.18",
 ]

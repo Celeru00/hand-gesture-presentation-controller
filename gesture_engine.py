@@ -29,7 +29,7 @@ import time
 from collections import deque
 from typing import Any, Deque, Optional
 
-from contracts import GestureEvent, SourceRequest
+from shared import GestureEvent, SourceRequest
 
 
 class GestureEngine:

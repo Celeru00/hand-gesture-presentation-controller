@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Union
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from contracts import FramePacket, GestureEvent, SourceRequest
+from shared import FramePacket, GestureEvent, SourceRequest
 
 try:
     import numpy as np

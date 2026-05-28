@@ -35,7 +35,7 @@ from typing import Any, Optional, Union
 import cv2
 import mediapipe as mp
 
-from contracts import FramePacket, SourceRequest
+from shared import FramePacket, SourceRequest
 
 
 class VisionEngine:

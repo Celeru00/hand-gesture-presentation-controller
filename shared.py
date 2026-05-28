@@ -9,6 +9,8 @@ Standard library only — zero external dependencies.
 Data flow:
     SourceRequest   Dev 3 → Dev 1   (change input source)
     FramePacket     Dev 1 → Dev 3   (raw annotated frame)
+    LandmarkPoint   Dev 1 → Dev 2   (single landmark coordinate)
+    LandmarkPacket  Dev 1 → Dev 2   (full frame of 21 landmarks)
     GestureEvent    Dev 2 → Dev 3   (confirmed gesture)
 """
 
@@ -16,7 +18,35 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+
+
+@dataclass
+class LandmarkPoint:
+    """One of the 21 MediaPipe hand landmark points."""
+    x: float
+    y: float
+    z: float = 0.0
+    visibility: Optional[float] = None
+    presence: Optional[float] = None
+
+
+@dataclass
+class LandmarkPacket:
+    """
+    Sent from Dev 1 (Vision Engine) to Dev 2 (Gesture Engine).
+
+    landmarks: list of exactly 21 LandmarkPoint objects in MediaPipe order.
+    frame_width / frame_height: pixel dimensions of the source frame.
+    """
+    frame_id: int
+    timestamp: float
+    landmarks: List[LandmarkPoint]
+    handedness: Optional[str] = None
+    hand_score: Optional[float] = None
+    frame_width: Optional[int] = None
+    frame_height: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -82,3 +112,14 @@ class GestureEvent:
     cursor_y: Optional[float] = None
     source_frame_id: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "gesture_type": self.gesture_type,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp,
+            "cursor_x": self.cursor_x,
+            "cursor_y": self.cursor_y,
+            "source_frame_id": self.source_frame_id,
+            "metadata": dict(self.metadata),
+        }

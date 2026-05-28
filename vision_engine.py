@@ -35,7 +35,7 @@ from typing import Any, Optional, Union
 import cv2
 import mediapipe as mp
 
-from shared import FramePacket, SourceRequest
+from shared import FramePacket, LandmarkPacket, LandmarkPoint, SourceRequest
 
 
 class VisionEngine:
@@ -146,15 +146,24 @@ class VisionEngine:
 
                 annotated, landmarks = self._process_frame(frame)
 
-                # Forward raw landmark results to Dev 2 if connected
-                if self.gesture_engine is not None and landmarks is not None:
+                # Forward landmark data to Dev 2 (gesture engine) if connected
+                if self.gesture_engine is not None:
                     try:
-                        self.gesture_engine.receive_landmarks(
-                            landmarks=landmarks,
-                            frame_id=self._frame_id,
-                            width=frame.shape[1],
-                            height=frame.shape[0],
-                        )
+                        if landmarks is not None:
+                            lm_list = [
+                                LandmarkPoint(x=lm.x, y=lm.y, z=lm.z)
+                                for lm in landmarks.landmark
+                            ]
+                            packet = LandmarkPacket(
+                                frame_id=self._frame_id,
+                                timestamp=time.time(),
+                                landmarks=lm_list,
+                                frame_width=frame.shape[1],
+                                frame_height=frame.shape[0],
+                            )
+                            self.gesture_engine.process_landmarks(packet)
+                        else:
+                            self.gesture_engine.process_no_hand()
                     except Exception:
                         pass  # Dev 2 not ready yet — fail silently
 

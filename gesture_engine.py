@@ -1,259 +1,1218 @@
 """
-gesture_engine.py
-=================
-Dev 2 — Gesture Recognition Engine
+person2_gesture_engine/gesture_engine.py
+
+Person 2 — Gesture Recognition Engine
 
 Responsibilities:
-- Receive raw MediaPipe landmarks from Dev1 via receive_landmarks().
-- Classify the hand shape and motion into a named gesture.
-- Smooth results over multiple frames to avoid flickering.
-- Send confirmed gesture events to Dev 3 via app.receive_gesture().
+- Receive 21 hand landmarks from Person 1.
+- Classify the hand shape or movement into a known gesture.
+- Smooth noisy results so gestures do not flicker.
+- Emit confirmed GestureEvent objects to Person 3.
 
-Does NOT:
-- Open a webcam or video file.
+This file deliberately does NOT:
+- Open webcam or video files.
 - Run MediaPipe.
-- Control the UI or send keyboard events.
-
-How it connects:
-    In main.py, after Dev 2 is ready:
-        gesture = GestureEngine(app)
-        vision.gesture_engine = gesture
-
-    Dev 1 calls gesture.receive_landmarks(...) each frame.
-    Dev 2 calls app.receive_gesture(event) when a gesture is confirmed.
+- Build a UI.
+- Send keyboard shortcuts.
+- Control PowerPoint.
 """
 
 from __future__ import annotations
 
+import math
 import time
-from collections import deque
-from typing import Any, Deque, Optional
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
-from shared import GestureEvent, SourceRequest
+from shared import GestureEvent, LandmarkPacket, LandmarkPoint
 
 
-class GestureEngine:
+# ---------------------------------------------------------------------
+# Canonical gesture names expected by Person 3
+# ---------------------------------------------------------------------
 
-    def __init__(self, app: Any) -> None:
-        """
-        Parameters
-        ----------
-        app:
-            The PresentationControllerApp instance (Dev 3).
-            GestureEngine calls app.receive_gesture(event) on confirmed gestures.
-        """
-        self._app = app
+NEXT_SLIDE = "next_slide"
+PREVIOUS_SLIDE = "previous_slide"
+START_PRESENTATION = "start_presentation"
+STOP_EXIT = "stop_exit"
+BLANK_SCREEN = "blank_screen"
+LASER_POINTER = "laser_pointer"
+DRAW_ANNOTATE = "draw_annotate"
+ZOOM_IN = "zoom_in"
+ZOOM_OUT = "zoom_out"
 
-        # --- put your state variables here ---
-        # e.g. rolling history buffer for smoothing, swipe tracking,
-        # last gesture timestamp for cooldown, previous pinch distance, etc.
+POINTER_GESTURES = {LASER_POINTER, DRAW_ANNOTATE}
 
-    # ------------------------------------------------------------------
-    # Entry point — called by Dev 1 every frame
-    # ------------------------------------------------------------------
+DISCRETE_STATIC_GESTURES = {
+    START_PRESENTATION,
+    STOP_EXIT,
+    BLANK_SCREEN,
+}
 
-    def receive_landmarks(
+DYNAMIC_GESTURES = {
+    NEXT_SLIDE,
+    PREVIOUS_SLIDE,
+    ZOOM_IN,
+    ZOOM_OUT,
+}
+
+
+class HandLandmark(IntEnum):
+    """
+    MediaPipe hand landmark index order.
+    """
+
+    WRIST = 0
+
+    THUMB_CMC = 1
+    THUMB_MCP = 2
+    THUMB_IP = 3
+    THUMB_TIP = 4
+
+    INDEX_MCP = 5
+    INDEX_PIP = 6
+    INDEX_DIP = 7
+    INDEX_TIP = 8
+
+    MIDDLE_MCP = 9
+    MIDDLE_PIP = 10
+    MIDDLE_DIP = 11
+    MIDDLE_TIP = 12
+
+    RING_MCP = 13
+    RING_PIP = 14
+    RING_DIP = 15
+    RING_TIP = 16
+
+    PINKY_MCP = 17
+    PINKY_PIP = 18
+    PINKY_DIP = 19
+    PINKY_TIP = 20
+
+
+@dataclass
+class GestureRecognitionConfig:
+    """
+    Tune these values depending on camera placement, distance, lighting,
+    and whether Person 1 mirrors the video feed.
+    """
+
+    # Static gesture confirmation
+    min_static_confidence: float = 0.72
+    stable_frames: int = 5
+    stable_ratio: float = 0.70
+    unstable_reset_frames: int = 4
+
+    # Swipe detection
+    swipe_history_seconds: float = 0.65
+    swipe_min_dx: float = 0.18
+    swipe_max_dy: float = 0.14
+    swipe_min_velocity: float = 0.55
+    swipe_cooldown_seconds: float = 0.90
+    mirror_swipe_x: bool = False
+
+    # Pinch zoom detection
+    pinch_closed_distance: float = 0.32
+    pinch_open_distance: float = 0.68
+    pinch_state_frames: int = 3
+    pinch_cooldown_seconds: float = 0.45
+
+    # Pointer smoothing
+    pointer_filter_min_cutoff: float = 1.0
+    pointer_filter_beta: float = 0.007
+    pointer_filter_derivative_cutoff: float = 1.0
+
+    # Event sending
+    emit_dict_to_callback: bool = True
+
+    # Cooldowns for static one-shot gestures.
+    # Pointer gestures are intentionally not cooled down because Person 3
+    # needs continuous cursor updates.
+    discrete_static_cooldowns: Dict[str, float] = field(
+        default_factory=lambda: {
+            START_PRESENTATION: 2.00,
+            STOP_EXIT: 1.50,
+            BLANK_SCREEN: 1.00,
+        }
+    )
+
+
+@dataclass
+class GestureCandidate:
+    gesture_type: str
+    confidence: float
+    cursor_x: Optional[float] = None
+    cursor_y: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HandFeatures:
+    landmarks: List[LandmarkPoint]
+
+    palm_x: float
+    palm_y: float
+    hand_scale: float
+
+    finger_extended: Dict[str, float]
+    finger_folded: Dict[str, float]
+
+    thumb_open_score: float
+    thumb_up_score: float
+
+    index_middle_separation: float
+    index_pinky_separation: float
+    pinch_distance: float
+
+    index_cursor_x: float
+    index_cursor_y: float
+    draw_cursor_x: float
+    draw_cursor_y: float
+
+
+# ---------------------------------------------------------------------
+# One Euro Filter
+# ---------------------------------------------------------------------
+
+class LowPassFilter:
+    def __init__(self) -> None:
+        self.initialized = False
+        self.previous_raw_value = 0.0
+        self.previous_filtered_value = 0.0
+
+    def filter(self, value: float, alpha: float) -> float:
+        if not self.initialized:
+            self.initialized = True
+            self.previous_raw_value = value
+            self.previous_filtered_value = value
+            return value
+
+        filtered = alpha * value + (1.0 - alpha) * self.previous_filtered_value
+        self.previous_raw_value = value
+        self.previous_filtered_value = filtered
+        return filtered
+
+
+class OneEuroFilter:
+    """
+    Small dependency-free implementation of the 1€ filter.
+
+    It smooths slow jitter strongly, while allowing faster movement to pass
+    with less lag.
+    """
+
+    def __init__(
         self,
-        landmarks: Any,
-        frame_id: int,
-        width: int,
-        height: int,
+        min_cutoff: float = 1.0,
+        beta: float = 0.007,
+        derivative_cutoff: float = 1.0,
     ) -> None:
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.derivative_cutoff = derivative_cutoff
+
+        self.x_filter = LowPassFilter()
+        self.dx_filter = LowPassFilter()
+        self.last_timestamp: Optional[float] = None
+
+    def reset(self) -> None:
+        self.x_filter = LowPassFilter()
+        self.dx_filter = LowPassFilter()
+        self.last_timestamp = None
+
+    def filter(self, value: float, timestamp: float) -> float:
+        if self.last_timestamp is None:
+            self.last_timestamp = timestamp
+            return self.x_filter.filter(value, 1.0)
+
+        dt = max(timestamp - self.last_timestamp, 1e-6)
+        self.last_timestamp = timestamp
+
+        previous_value = self.x_filter.previous_raw_value
+        derivative = (value - previous_value) / dt
+
+        derivative_alpha = self._alpha(dt, self.derivative_cutoff)
+        smoothed_derivative = self.dx_filter.filter(derivative, derivative_alpha)
+
+        cutoff = self.min_cutoff + self.beta * abs(smoothed_derivative)
+        alpha = self._alpha(dt, cutoff)
+
+        return self.x_filter.filter(value, alpha)
+
+    @staticmethod
+    def _alpha(dt: float, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+
+# ---------------------------------------------------------------------
+# Gesture engine
+# ---------------------------------------------------------------------
+
+class GestureRecognitionEngine:
+    """
+    Main Person 2 class.
+
+    Typical connection:
+
+        gesture_engine = GestureRecognitionEngine(
+            on_gesture=ui.receive_gesture
+        )
+
+        # Person 1 calls this every frame:
+        gesture_engine.process_landmarks(landmark_packet)
+    """
+
+    def __init__(
+        self,
+        on_gesture: Optional[Callable[[Union[GestureEvent, Dict[str, Any]]], None]] = None,
+        config: Optional[GestureRecognitionConfig] = None,
+    ) -> None:
+        self.on_gesture = on_gesture
+        self.config = config or GestureRecognitionConfig()
+
+        self._static_window: Deque[GestureCandidate] = deque(
+            maxlen=self.config.stable_frames
+        )
+        self._unstable_frames = 0
+        self._active_static_name: Optional[str] = None
+        self._active_static_emitted = False
+
+        self._motion_history: Deque[Tuple[float, float, float]] = deque()
+        self._last_emitted_at: Dict[str, float] = {}
+
+        self._pinch_window: Deque[Tuple[Optional[str], float]] = deque(
+            maxlen=self.config.pinch_state_frames
+        )
+        self._stable_pinch_state: Optional[str] = None
+
+        self._pointer_x_filter = OneEuroFilter(
+            min_cutoff=self.config.pointer_filter_min_cutoff,
+            beta=self.config.pointer_filter_beta,
+            derivative_cutoff=self.config.pointer_filter_derivative_cutoff,
+        )
+        self._pointer_y_filter = OneEuroFilter(
+            min_cutoff=self.config.pointer_filter_min_cutoff,
+            beta=self.config.pointer_filter_beta,
+            derivative_cutoff=self.config.pointer_filter_derivative_cutoff,
+        )
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def process_landmarks(
+        self,
+        packet: Union[LandmarkPacket, Mapping[str, Any]],
+    ) -> Optional[GestureEvent]:
         """
-        Called by VisionEngine every frame with raw MediaPipe landmark data.
+        Process one frame of hand landmarks.
 
-        Parameters
-        ----------
-        landmarks:
-            mediapipe.framework.formats.landmark_pb2.NormalizedLandmarkList
-            A list of 21 landmarks. Access each as landmarks.landmark[i]
-            where i is the MediaPipe index (0 = wrist, 8 = index tip, etc.)
-            Each landmark has .x, .y, .z normalized to [0.0, 1.0].
+        Returns:
+            GestureEvent if a stable gesture is confirmed.
+            None otherwise.
 
-        frame_id:
-            Incrementing frame counter from Dev 1.
-            Use this to detect dropped frames if needed.
-
-        width / height:
-            Pixel dimensions of the source frame.
-            Use these to convert normalized coords to pixel coords if needed:
-                px = int(landmark.x * width)
-                py = int(landmark.y * height)
-
-        What to do here:
-            1. Extract the landmarks you need (fingertips, wrist, etc.)
-            2. Run finger state detection (extended vs folded)
-            3. Check for swipe motion using a rolling wrist position buffer
-            4. Run static pose classification on finger states
-            5. Smooth the result over N frames
-            6. If a stable gesture is confirmed, call self._emit(gesture_type, confidence)
-            7. For pointer/draw gestures, also pass cursor_x and cursor_y
-        """
-
-        # --- your implementation here ---
-        pass
-
-    # ------------------------------------------------------------------
-    # Internal helpers — implement these
-    # ------------------------------------------------------------------
-
-    def _get_finger_states(self, landmarks: Any) -> dict:
-        """
-        Determine which fingers are extended vs folded.
-
-        For index, middle, ring, pinky:
-            Compare fingertip y to PIP joint y.
-            If tip.y < pip.y, the finger is extended (tip is higher on screen).
-
-        For thumb:
-            Lateral check — compare thumb tip x to thumb IP joint x.
-
-        Returns
-        -------
-        dict with keys: "thumb", "index", "middle", "ring", "pinky"
-        Values are True (extended) or False (folded).
-
-        Landmark indices to use:
-            Thumb:  tip=4,  ip=3
-            Index:  tip=8,  pip=6
-            Middle: tip=12, pip=10
-            Ring:   tip=16, pip=14
-            Pinky:  tip=20, pip=18
-        """
-
-        # --- your implementation here ---
-        pass
-
-    def _classify_static(self, finger_states: dict, landmarks: Any):
-        """
-        Map finger states to a gesture type string.
-
-        Use the table below. Return (gesture_type, confidence).
-        confidence is a float in [0.0, 1.0] — how certain you are.
-
-        Gesture type strings must match what controller.py expects.
-        Use normalize_gesture_name() aliases or the exact canonical names:
-            "next_slide", "previous_slide",
-            "start_presentation", "stop_exit",
-            "blank_screen", "laser_pointer",
-            "draw_annotate", "zoom_in", "zoom_out"
-
-        Classification table (T=Thumb I=Index M=Middle R=Ring P=Pinky):
-
-            T  I  M  R  P  → gesture
-            1  1  1  1  1  → start_presentation   (open palm)
-            0  0  0  0  0  → stop_exit            (fist)
-            0  1  0  0  0  → laser_pointer         (index only)
-            0  1  1  0  0  → draw_annotate         (peace sign)
-            1  0  0  0  0  → blank_screen          (thumbs up)
-            (pinch)        → zoom_in / zoom_out    (see _detect_pinch)
-            (swipe)        → next_slide / prev_slide (see _detect_swipe)
-            (else)         → unknown / no emit
-
-        Returns
-        -------
-        tuple[str, float] — (gesture_type_string, confidence)
-        """
-
-        # --- your implementation here ---
-        pass
-
-    def _detect_swipe(self, landmarks: Any) -> Optional[str]:
-        """
-        Detect left/right swipe using wrist x-position over time.
-
-        Approach:
-            Keep a rolling buffer (deque) of the last N wrist x values.
-            dx = buffer[-1] - buffer[0]
-            If dx > threshold  → "next_slide"
-            If dx < -threshold → "previous_slide"
-            Apply a cooldown so one swipe doesn't fire multiple times.
-
-        Wrist landmark index: 0
-            wrist_x = landmarks.landmark[0].x   (normalized 0.0 to 1.0)
-
-        Suggested values to tune:
-            buffer length:  5 frames
-            threshold:      0.12 (normalized units)
-            cooldown:       0.8 seconds
-
-        Returns
-        -------
-        gesture type string if swipe detected, None otherwise.
+        If self.on_gesture is set, the event is also sent to that callback.
         """
 
-        # --- your implementation here ---
-        pass
+        landmark_packet = self._coerce_landmark_packet(packet)
 
-    def _detect_pinch(self, landmarks: Any) -> Optional[str]:
+        if len(landmark_packet.landmarks) != 21:
+            self.process_no_hand()
+            return None
+
+        features = self._extract_features(landmark_packet.landmarks)
+
+        self._update_motion_history(
+            timestamp=landmark_packet.timestamp,
+            palm_x=features.palm_x,
+            palm_y=features.palm_y,
+        )
+
+        static_candidate = self._classify_static_gesture(features)
+
+        # Pointer and draw gestures intentionally suppress swipe detection.
+        # Otherwise moving the pointer could accidentally become a swipe.
+        if static_candidate is None or static_candidate.gesture_type not in POINTER_GESTURES:
+            swipe_event = self._detect_swipe(landmark_packet, features)
+            if swipe_event is not None:
+                self._reset_static_stability()
+                self._emit(swipe_event)
+                return swipe_event
+
+        pinch_event = self._detect_pinch_transition(landmark_packet, features)
+        if pinch_event is not None:
+            self._reset_static_stability()
+            self._emit(pinch_event)
+            return pinch_event
+
+        static_event = self._stabilize_static_candidate(
+            packet=landmark_packet,
+            candidate=static_candidate,
+        )
+
+        if static_event is not None:
+            self._emit(static_event)
+            return static_event
+
+        return None
+
+    def process_no_hand(self) -> None:
         """
-        Detect pinch open/close using thumb tip and index tip distance.
-
-        Approach:
-            Compute Euclidean distance between thumb tip (4) and index tip (8).
-            Compare to the previous frame's distance stored in self.
-            If distance increasing past threshold → "zoom_out"
-            If distance decreasing past threshold → "zoom_in"
-
-        Suggested threshold: 0.06 (normalized units)
-
-        Returns
-        -------
-        gesture type string if pinch detected, None otherwise.
+        Call this when Person 1 has no hand landmarks for the current frame.
         """
 
-        # --- your implementation here ---
-        pass
+        self._reset_static_stability()
+        self._motion_history.clear()
+        self._pinch_window.clear()
+        self._stable_pinch_state = None
+        self._pointer_x_filter.reset()
+        self._pointer_y_filter.reset()
 
-    def _smooth(self, gesture_type: str) -> Optional[str]:
+    # Friendly aliases
+    update = process_landmarks
+    process = process_landmarks
+
+    # -----------------------------------------------------------------
+    # Feature extraction
+    # -----------------------------------------------------------------
+
+    def _extract_features(self, lms: List[LandmarkPoint]) -> HandFeatures:
+        wrist = lms[HandLandmark.WRIST]
+
+        palm_points = [
+            lms[HandLandmark.WRIST],
+            lms[HandLandmark.INDEX_MCP],
+            lms[HandLandmark.MIDDLE_MCP],
+            lms[HandLandmark.RING_MCP],
+            lms[HandLandmark.PINKY_MCP],
+        ]
+
+        palm_x = sum(p.x for p in palm_points) / len(palm_points)
+        palm_y = sum(p.y for p in palm_points) / len(palm_points)
+
+        # Palm scale keeps thresholds independent of distance from camera.
+        hand_scale = max(
+            self._distance(wrist, lms[HandLandmark.MIDDLE_MCP]),
+            self._distance(lms[HandLandmark.INDEX_MCP], lms[HandLandmark.PINKY_MCP]),
+            1e-6,
+        )
+
+        index_ext = self._long_finger_extended_score(
+            lms, HandLandmark.INDEX_MCP, HandLandmark.INDEX_PIP,
+            HandLandmark.INDEX_DIP, HandLandmark.INDEX_TIP, hand_scale
+        )
+        middle_ext = self._long_finger_extended_score(
+            lms, HandLandmark.MIDDLE_MCP, HandLandmark.MIDDLE_PIP,
+            HandLandmark.MIDDLE_DIP, HandLandmark.MIDDLE_TIP, hand_scale
+        )
+        ring_ext = self._long_finger_extended_score(
+            lms, HandLandmark.RING_MCP, HandLandmark.RING_PIP,
+            HandLandmark.RING_DIP, HandLandmark.RING_TIP, hand_scale
+        )
+        pinky_ext = self._long_finger_extended_score(
+            lms, HandLandmark.PINKY_MCP, HandLandmark.PINKY_PIP,
+            HandLandmark.PINKY_DIP, HandLandmark.PINKY_TIP, hand_scale
+        )
+
+        thumb_open = self._thumb_open_score(lms, hand_scale)
+        thumb_up = self._thumb_up_score(lms, hand_scale, thumb_open)
+
+        finger_extended = {
+            "thumb": thumb_open,
+            "index": index_ext,
+            "middle": middle_ext,
+            "ring": ring_ext,
+            "pinky": pinky_ext,
+        }
+
+        finger_folded = {
+            "thumb": 1.0 - thumb_open,
+            "index": self._long_finger_folded_score(
+                lms, HandLandmark.INDEX_MCP, HandLandmark.INDEX_PIP,
+                HandLandmark.INDEX_TIP, index_ext, hand_scale
+            ),
+            "middle": self._long_finger_folded_score(
+                lms, HandLandmark.MIDDLE_MCP, HandLandmark.MIDDLE_PIP,
+                HandLandmark.MIDDLE_TIP, middle_ext, hand_scale
+            ),
+            "ring": self._long_finger_folded_score(
+                lms, HandLandmark.RING_MCP, HandLandmark.RING_PIP,
+                HandLandmark.RING_TIP, ring_ext, hand_scale
+            ),
+            "pinky": self._long_finger_folded_score(
+                lms, HandLandmark.PINKY_MCP, HandLandmark.PINKY_PIP,
+                HandLandmark.PINKY_TIP, pinky_ext, hand_scale
+            ),
+        }
+
+        index_middle_separation = (
+            self._distance(lms[HandLandmark.INDEX_TIP], lms[HandLandmark.MIDDLE_TIP])
+            / hand_scale
+        )
+
+        index_pinky_separation = (
+            self._distance(lms[HandLandmark.INDEX_TIP], lms[HandLandmark.PINKY_TIP])
+            / hand_scale
+        )
+
+        pinch_distance = (
+            self._distance(lms[HandLandmark.THUMB_TIP], lms[HandLandmark.INDEX_TIP])
+            / hand_scale
+        )
+
+        index_tip = lms[HandLandmark.INDEX_TIP]
+        middle_tip = lms[HandLandmark.MIDDLE_TIP]
+
+        return HandFeatures(
+            landmarks=lms,
+            palm_x=palm_x,
+            palm_y=palm_y,
+            hand_scale=hand_scale,
+            finger_extended=finger_extended,
+            finger_folded=finger_folded,
+            thumb_open_score=thumb_open,
+            thumb_up_score=thumb_up,
+            index_middle_separation=index_middle_separation,
+            index_pinky_separation=index_pinky_separation,
+            pinch_distance=pinch_distance,
+            index_cursor_x=index_tip.x,
+            index_cursor_y=index_tip.y,
+            draw_cursor_x=(index_tip.x + middle_tip.x) / 2.0,
+            draw_cursor_y=(index_tip.y + middle_tip.y) / 2.0,
+        )
+
+    def _long_finger_extended_score(
+        self,
+        lms: List[LandmarkPoint],
+        mcp_i: int,
+        pip_i: int,
+        dip_i: int,
+        tip_i: int,
+        scale: float,
+    ) -> float:
+        wrist = lms[HandLandmark.WRIST]
+        mcp = lms[mcp_i]
+        pip = lms[pip_i]
+        dip = lms[dip_i]
+        tip = lms[tip_i]
+
+        tip_wrist = self._distance(tip, wrist)
+        pip_wrist = self._distance(pip, wrist)
+
+        # Extended fingers usually have the tip farther from wrist than PIP.
+        distance_score = self._score_range((tip_wrist - pip_wrist) / scale, 0.05, 0.45)
+
+        # For this project, index/peace/open palm are meant to face upward.
+        # In image coordinates, smaller y means higher on screen.
+        vertical_score = self._score_range((pip.y - tip.y) / scale, 0.08, 0.55)
+
+        # Straightness from MCP-PIP-DIP-TIP chain.
+        angle_1 = self._angle_degrees(mcp, pip, dip)
+        angle_2 = self._angle_degrees(pip, dip, tip)
+        straightness_score = (
+            self._score_range(angle_1, 135.0, 175.0)
+            + self._score_range(angle_2, 135.0, 175.0)
+        ) / 2.0
+
+        return self._clamp01(
+            0.45 * distance_score
+            + 0.30 * vertical_score
+            + 0.25 * straightness_score
+        )
+
+    def _long_finger_folded_score(
+        self,
+        lms: List[LandmarkPoint],
+        mcp_i: int,
+        pip_i: int,
+        tip_i: int,
+        extended_score: float,
+        scale: float,
+    ) -> float:
+        mcp = lms[mcp_i]
+        pip = lms[pip_i]
+        tip = lms[tip_i]
+
+        tip_close_to_mcp = 1.0 - self._score_range(
+            self._distance(tip, mcp) / scale,
+            0.55,
+            1.35,
+        )
+
+        tip_not_above_pip = 1.0 - self._score_range(
+            (pip.y - tip.y) / scale,
+            0.05,
+            0.40,
+        )
+
+        return self._clamp01(
+            0.60 * (1.0 - extended_score)
+            + 0.25 * tip_close_to_mcp
+            + 0.15 * tip_not_above_pip
+        )
+
+    def _thumb_open_score(
+        self,
+        lms: List[LandmarkPoint],
+        scale: float,
+    ) -> float:
+        thumb_mcp = lms[HandLandmark.THUMB_MCP]
+        thumb_ip = lms[HandLandmark.THUMB_IP]
+        thumb_tip = lms[HandLandmark.THUMB_TIP]
+        index_mcp = lms[HandLandmark.INDEX_MCP]
+
+        thumb_length_score = self._score_range(
+            self._distance(thumb_tip, thumb_mcp) / scale,
+            0.45,
+            1.00,
+        )
+
+        thumb_away_from_palm_score = self._score_range(
+            self._distance(thumb_tip, index_mcp) / scale,
+            0.45,
+            1.05,
+        )
+
+        thumb_straight_score = self._score_range(
+            self._angle_degrees(thumb_mcp, thumb_ip, thumb_tip),
+            125.0,
+            170.0,
+        )
+
+        return self._clamp01(
+            0.40 * thumb_length_score
+            + 0.40 * thumb_away_from_palm_score
+            + 0.20 * thumb_straight_score
+        )
+
+    def _thumb_up_score(
+        self,
+        lms: List[LandmarkPoint],
+        scale: float,
+        thumb_open_score: float,
+    ) -> float:
+        wrist = lms[HandLandmark.WRIST]
+        thumb_mcp = lms[HandLandmark.THUMB_MCP]
+        thumb_tip = lms[HandLandmark.THUMB_TIP]
+        index_mcp = lms[HandLandmark.INDEX_MCP]
+
+        tip_above_mcp = self._score_range(
+            (thumb_mcp.y - thumb_tip.y) / scale,
+            0.15,
+            0.80,
+        )
+
+        tip_above_index_base = self._score_range(
+            (index_mcp.y - thumb_tip.y) / scale,
+            0.10,
+            0.70,
+        )
+
+        tip_above_wrist = self._score_range(
+            (wrist.y - thumb_tip.y) / scale,
+            0.10,
+            0.80,
+        )
+
+        return self._clamp01(
+            0.35 * thumb_open_score
+            + 0.30 * tip_above_mcp
+            + 0.20 * tip_above_index_base
+            + 0.15 * tip_above_wrist
+        )
+
+    # -----------------------------------------------------------------
+    # Static gesture classification
+    # -----------------------------------------------------------------
+
+    def _classify_static_gesture(
+        self,
+        f: HandFeatures,
+    ) -> Optional[GestureCandidate]:
+        ext = f.finger_extended
+        fold = f.finger_folded
+
+        open_spread_score = self._score_range(f.index_pinky_separation, 1.20, 2.20)
+
+        open_palm_score = self._mean(
+            ext["thumb"],
+            ext["index"],
+            ext["middle"],
+            ext["ring"],
+            ext["pinky"],
+            open_spread_score,
+        )
+
+        fist_score = self._mean(
+            fold["thumb"],
+            fold["index"],
+            fold["middle"],
+            fold["ring"],
+            fold["pinky"],
+        )
+
+        thumbs_up_score = self._mean(
+            f.thumb_up_score,
+            fold["index"],
+            fold["middle"],
+            fold["ring"],
+            fold["pinky"],
+        )
+
+        index_only_score = self._mean(
+            ext["index"],
+            fold["thumb"],
+            fold["middle"],
+            fold["ring"],
+            fold["pinky"],
+        )
+
+        peace_separation_score = self._score_range(
+            f.index_middle_separation,
+            0.25,
+            0.75,
+        )
+
+        peace_score = self._mean(
+            ext["index"],
+            ext["middle"],
+            fold["thumb"],
+            fold["ring"],
+            fold["pinky"],
+            peace_separation_score,
+        )
+
+        candidates = [
+            GestureCandidate(
+                gesture_type=START_PRESENTATION,
+                confidence=open_palm_score,
+                metadata={"reason": "open palm"},
+            ),
+            GestureCandidate(
+                gesture_type=STOP_EXIT,
+                confidence=fist_score,
+                metadata={"reason": "closed fist"},
+            ),
+            GestureCandidate(
+                gesture_type=BLANK_SCREEN,
+                confidence=thumbs_up_score,
+                metadata={"reason": "thumbs up"},
+            ),
+            GestureCandidate(
+                gesture_type=LASER_POINTER,
+                confidence=index_only_score,
+                cursor_x=f.index_cursor_x,
+                cursor_y=f.index_cursor_y,
+                metadata={"reason": "index finger only"},
+            ),
+            GestureCandidate(
+                gesture_type=DRAW_ANNOTATE,
+                confidence=peace_score,
+                cursor_x=f.draw_cursor_x,
+                cursor_y=f.draw_cursor_y,
+                metadata={"reason": "peace sign"},
+            ),
+        ]
+
+        best = max(candidates, key=lambda c: c.confidence)
+
+        if best.confidence < self.config.min_static_confidence:
+            return None
+
+        best.metadata.update(
+            {
+                "finger_extended": dict(ext),
+                "finger_folded": dict(fold),
+                "pinch_distance": f.pinch_distance,
+                "hand_scale": f.hand_scale,
+            }
+        )
+
+        return best
+
+    # -----------------------------------------------------------------
+    # Static gesture stabilization
+    # -----------------------------------------------------------------
+
+    def _stabilize_static_candidate(
+        self,
+        packet: LandmarkPacket,
+        candidate: Optional[GestureCandidate],
+    ) -> Optional[GestureEvent]:
+        if candidate is None:
+            self._unstable_frames += 1
+
+            if self._unstable_frames >= self.config.unstable_reset_frames:
+                self._reset_static_stability()
+
+            return None
+
+        self._unstable_frames = 0
+        self._static_window.append(candidate)
+
+        if len(self._static_window) < self.config.stable_frames:
+            return None
+
+        names = [c.gesture_type for c in self._static_window]
+        counts = Counter(names)
+        stable_name, count = counts.most_common(1)[0]
+
+        ratio = count / len(self._static_window)
+
+        if ratio < self.config.stable_ratio:
+            return None
+
+        stable_candidates = [
+            c for c in self._static_window
+            if c.gesture_type == stable_name
+        ]
+
+        average_confidence = self._mean(*(c.confidence for c in stable_candidates))
+
+        if average_confidence < self.config.min_static_confidence:
+            return None
+
+        latest_same = stable_candidates[-1]
+
+        if stable_name != self._active_static_name:
+            self._active_static_name = stable_name
+            self._active_static_emitted = False
+
+        # Pointer gestures need continuous events, because Person 3 moves
+        # or drags the cursor based on these coordinates.
+        if stable_name in POINTER_GESTURES:
+            cursor_x, cursor_y = self._smooth_cursor(
+                latest_same.cursor_x,
+                latest_same.cursor_y,
+                packet.timestamp,
+            )
+
+            return GestureEvent(
+                gesture_type=stable_name,
+                confidence=average_confidence,
+                timestamp=packet.timestamp,
+                cursor_x=cursor_x,
+                cursor_y=cursor_y,
+                source_frame_id=packet.frame_id,
+                metadata=dict(latest_same.metadata),
+            )
+
+        # One-shot static gestures should emit once per hold.
+        if self._active_static_emitted:
+            return None
+
+        if not self._cooldown_ok(stable_name, packet.timestamp):
+            return None
+
+        self._active_static_emitted = True
+        self._last_emitted_at[stable_name] = packet.timestamp
+
+        return GestureEvent(
+            gesture_type=stable_name,
+            confidence=average_confidence,
+            timestamp=packet.timestamp,
+            source_frame_id=packet.frame_id,
+            metadata=dict(latest_same.metadata),
+        )
+
+    def _reset_static_stability(self) -> None:
+        self._static_window.clear()
+        self._unstable_frames = 0
+        self._active_static_name = None
+        self._active_static_emitted = False
+        self._pointer_x_filter.reset()
+        self._pointer_y_filter.reset()
+
+    # -----------------------------------------------------------------
+    # Swipe detection
+    # -----------------------------------------------------------------
+
+    def _update_motion_history(
+        self,
+        timestamp: float,
+        palm_x: float,
+        palm_y: float,
+    ) -> None:
+        self._motion_history.append((timestamp, palm_x, palm_y))
+
+        cutoff = timestamp - self.config.swipe_history_seconds
+
+        while self._motion_history and self._motion_history[0][0] < cutoff:
+            self._motion_history.popleft()
+
+    def _detect_swipe(
+        self,
+        packet: LandmarkPacket,
+        features: HandFeatures,
+    ) -> Optional[GestureEvent]:
+        if len(self._motion_history) < 3:
+            return None
+
+        start_t, start_x, start_y = self._motion_history[0]
+        end_t, end_x, end_y = self._motion_history[-1]
+
+        dt = max(end_t - start_t, 1e-6)
+        dx = end_x - start_x
+        dy = end_y - start_y
+
+        if self.config.mirror_swipe_x:
+            dx = -dx
+
+        abs_dx = abs(dx)
+        abs_dy = abs(dy)
+        velocity = abs_dx / dt
+
+        if abs_dx < self.config.swipe_min_dx:
+            return None
+
+        if abs_dy > self.config.swipe_max_dy:
+            return None
+
+        if velocity < self.config.swipe_min_velocity:
+            return None
+
+        gesture = NEXT_SLIDE if dx > 0 else PREVIOUS_SLIDE
+
+        if not self._cooldown_ok(gesture, packet.timestamp, self.config.swipe_cooldown_seconds):
+            return None
+
+        displacement_score = self._score_range(
+            abs_dx,
+            self.config.swipe_min_dx,
+            self.config.swipe_min_dx * 1.85,
+        )
+
+        velocity_score = self._score_range(
+            velocity,
+            self.config.swipe_min_velocity,
+            self.config.swipe_min_velocity * 2.00,
+        )
+
+        vertical_penalty = 1.0 - self._score_range(
+            abs_dy,
+            self.config.swipe_max_dy * 0.50,
+            self.config.swipe_max_dy,
+        )
+
+        confidence = self._clamp01(
+            0.45 * displacement_score
+            + 0.40 * velocity_score
+            + 0.15 * vertical_penalty
+        )
+
+        self._last_emitted_at[gesture] = packet.timestamp
+        self._motion_history.clear()
+
+        return GestureEvent(
+            gesture_type=gesture,
+            confidence=confidence,
+            timestamp=packet.timestamp,
+            source_frame_id=packet.frame_id,
+            metadata={
+                "reason": "horizontal palm swipe",
+                "dx": dx,
+                "dy": dy,
+                "velocity": velocity,
+                "palm_x": features.palm_x,
+                "palm_y": features.palm_y,
+            },
+        )
+
+    # -----------------------------------------------------------------
+    # Pinch zoom detection
+    # -----------------------------------------------------------------
+
+    def _detect_pinch_transition(
+        self,
+        packet: LandmarkPacket,
+        features: HandFeatures,
+    ) -> Optional[GestureEvent]:
+        fold = features.finger_folded
+        ext = features.finger_extended
+
+        other_fingers_folded = self._mean(
+            fold["middle"],
+            fold["ring"],
+            fold["pinky"],
+        )
+
+        thumb_index_active = self._mean(
+            max(features.thumb_open_score, features.thumb_up_score),
+            max(ext["index"], 1.0 - fold["index"]),
+        )
+
+        pinch_shape_score = self._mean(
+            other_fingers_folded,
+            thumb_index_active,
+        )
+
+        if pinch_shape_score < 0.55:
+            state: Optional[str] = None
+            confidence = 0.0
+        elif features.pinch_distance <= self.config.pinch_closed_distance:
+            state = "closed"
+            distance_score = 1.0 - self._score_range(
+                features.pinch_distance,
+                self.config.pinch_closed_distance,
+                self.config.pinch_open_distance,
+            )
+            confidence = self._clamp01(
+                0.55 * distance_score + 0.45 * pinch_shape_score
+            )
+        elif features.pinch_distance >= self.config.pinch_open_distance:
+            state = "open"
+            distance_score = self._score_range(
+                features.pinch_distance,
+                self.config.pinch_closed_distance,
+                self.config.pinch_open_distance,
+            )
+            confidence = self._clamp01(
+                0.55 * distance_score + 0.45 * pinch_shape_score
+            )
+        else:
+            state = None
+            confidence = 0.0
+
+        self._pinch_window.append((state, confidence))
+
+        if len(self._pinch_window) < self.config.pinch_state_frames:
+            return None
+
+        states = [s for s, _ in self._pinch_window]
+        state_counts = Counter(states)
+        stable_state, count = state_counts.most_common(1)[0]
+
+        if stable_state is None:
+            if count == len(self._pinch_window):
+                self._stable_pinch_state = None
+            return None
+
+        if count < self.config.pinch_state_frames:
+            return None
+
+        average_confidence = self._mean(
+            *(conf for s, conf in self._pinch_window if s == stable_state)
+        )
+
+        previous_state = self._stable_pinch_state
+
+        if previous_state == stable_state:
+            return None
+
+        self._stable_pinch_state = stable_state
+
+        if previous_state is None:
+            return None
+
+        if previous_state == "closed" and stable_state == "open":
+            gesture = ZOOM_IN
+        elif previous_state == "open" and stable_state == "closed":
+            gesture = ZOOM_OUT
+        else:
+            return None
+
+        if not self._cooldown_ok(
+            gesture,
+            packet.timestamp,
+            self.config.pinch_cooldown_seconds,
+        ):
+            return None
+
+        self._last_emitted_at[gesture] = packet.timestamp
+
+        return GestureEvent(
+            gesture_type=gesture,
+            confidence=average_confidence,
+            timestamp=packet.timestamp,
+            source_frame_id=packet.frame_id,
+            metadata={
+                "reason": "pinch transition",
+                "previous_pinch_state": previous_state,
+                "current_pinch_state": stable_state,
+                "pinch_distance": features.pinch_distance,
+            },
+        )
+
+    # -----------------------------------------------------------------
+    # Cursor smoothing
+    # -----------------------------------------------------------------
+
+    def _smooth_cursor(
+        self,
+        x: Optional[float],
+        y: Optional[float],
+        timestamp: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if x is None or y is None:
+            return None, None
+
+        sx = self._pointer_x_filter.filter(float(x), timestamp)
+        sy = self._pointer_y_filter.filter(float(y), timestamp)
+
+        return self._clamp01(sx), self._clamp01(sy)
+
+    # -----------------------------------------------------------------
+    # Event output
+    # -----------------------------------------------------------------
+
+    def _emit(self, event: GestureEvent) -> None:
+        if self.on_gesture is None:
+            return
+
+        payload: Union[GestureEvent, Dict[str, Any]]
+
+        if self.config.emit_dict_to_callback:
+            payload = event.to_dict()
+        else:
+            payload = event
+
+        self.on_gesture(payload)
+
+    # -----------------------------------------------------------------
+    # Packet coercion
+    # -----------------------------------------------------------------
+
+    def _coerce_landmark_packet(
+        self,
+        packet: Union[LandmarkPacket, Mapping[str, Any]],
+    ) -> LandmarkPacket:
+        if isinstance(packet, LandmarkPacket):
+            return packet
+
+        landmarks_raw = (
+            packet.get("landmarks")
+            or packet.get("hand_landmarks")
+            or packet.get("points")
+        )
+
+        if landmarks_raw is None:
+            raise ValueError(
+                "Landmark packet must contain 'landmarks', "
+                "'hand_landmarks', or 'points'."
+            )
+
+        landmarks = [self._coerce_landmark_point(p) for p in landmarks_raw]
+
+        return LandmarkPacket(
+            frame_id=int(packet.get("frame_id", packet.get("id", 0))),
+            timestamp=float(packet.get("timestamp", time.time())),
+            landmarks=landmarks,
+            handedness=packet.get("handedness"),
+            hand_score=packet.get("hand_score", packet.get("score")),
+            frame_width=packet.get("frame_width", packet.get("width")),
+            frame_height=packet.get("frame_height", packet.get("height")),
+            metadata=dict(packet.get("metadata", {})),
+        )
+
+    @staticmethod
+    def _coerce_landmark_point(point: Any) -> LandmarkPoint:
+        if isinstance(point, LandmarkPoint):
+            return point
+
+        if isinstance(point, Mapping):
+            return LandmarkPoint(
+                x=float(point["x"]),
+                y=float(point["y"]),
+                z=float(point.get("z", 0.0)),
+                visibility=point.get("visibility"),
+                presence=point.get("presence"),
+            )
+
+        if isinstance(point, (tuple, list)):
+            if len(point) < 2:
+                raise ValueError("Landmark tuple/list must contain at least x and y.")
+
+            return LandmarkPoint(
+                x=float(point[0]),
+                y=float(point[1]),
+                z=float(point[2]) if len(point) >= 3 else 0.0,
+            )
+
+        # Supports MediaPipe NormalizedLandmark-like objects with .x/.y/.z.
+        if hasattr(point, "x") and hasattr(point, "y"):
+            return LandmarkPoint(
+                x=float(point.x),
+                y=float(point.y),
+                z=float(getattr(point, "z", 0.0)),
+                visibility=getattr(point, "visibility", None),
+                presence=getattr(point, "presence", None),
+            )
+
+        raise TypeError(f"Unsupported landmark point type: {type(point)!r}")
+
+    # -----------------------------------------------------------------
+    # Math helpers
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _distance(a: LandmarkPoint, b: LandmarkPoint) -> float:
+        return math.sqrt(
+            (a.x - b.x) ** 2
+            + (a.y - b.y) ** 2
+            + (a.z - b.z) ** 2
+        )
+
+    @staticmethod
+    def _angle_degrees(
+        a: LandmarkPoint,
+        b: LandmarkPoint,
+        c: LandmarkPoint,
+    ) -> float:
         """
-        Reduce flickering by requiring a gesture to appear consistently
-        across a rolling window of frames before emitting it.
-
-        Approach:
-            Keep a deque of the last N classified gesture strings.
-            Only return a gesture if it appears in > 70% of the window.
-            If the window is mixed, return None (not stable yet).
-
-        Suggested window size: 5–8 frames.
-
-        Returns
-        -------
-        The stable gesture type string, or None if not stable yet.
+        Returns angle ABC in degrees.
         """
 
-        # --- your implementation here ---
-        pass
+        bax = a.x - b.x
+        bay = a.y - b.y
+        baz = a.z - b.z
 
-    def _emit(
+        bcx = c.x - b.x
+        bcy = c.y - b.y
+        bcz = c.z - b.z
+
+        dot = bax * bcx + bay * bcy + baz * bcz
+
+        mag_ba = math.sqrt(bax * bax + bay * bay + baz * baz)
+        mag_bc = math.sqrt(bcx * bcx + bcy * bcy + bcz * bcz)
+
+        denom = max(mag_ba * mag_bc, 1e-9)
+        cos_angle = max(-1.0, min(1.0, dot / denom))
+
+        return math.degrees(math.acos(cos_angle))
+
+    @staticmethod
+    def _score_range(value: float, low: float, high: float) -> float:
+        if high <= low:
+            return 1.0 if value >= high else 0.0
+
+        return max(0.0, min(1.0, (value - low) / (high - low)))
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
+    def _mean(*values: float) -> float:
+        if not values:
+            return 0.0
+
+        return sum(values) / len(values)
+
+    def _cooldown_ok(
         self,
         gesture_type: str,
-        confidence: float,
-        cursor_x: Optional[float] = None,
-        cursor_y: Optional[float] = None,
-        frame_id: int = -1,
-    ) -> None:
-        """
-        Send a confirmed gesture to Dev 3.
+        timestamp: float,
+        override_cooldown: Optional[float] = None,
+    ) -> bool:
+        if override_cooldown is not None:
+            cooldown = override_cooldown
+        elif gesture_type in self.config.discrete_static_cooldowns:
+            cooldown = self.config.discrete_static_cooldowns[gesture_type]
+        else:
+            cooldown = 0.0
 
-        Do NOT call this directly from receive_landmarks —
-        always pass through _smooth() first so only stable gestures emit.
-
-        cursor_x / cursor_y:
-            Only needed for "laser_pointer" and "draw_annotate".
-            Pass the normalized index finger tip x and y:
-                cursor_x = landmarks.landmark[8].x
-                cursor_y = landmarks.landmark[8].y
-
-        Dev 3 handles everything after this — no further action needed.
-        """
-
-        event = GestureEvent(
-            gesture_type=gesture_type,
-            confidence=confidence,
-            timestamp=time.time(),
-            cursor_x=cursor_x,
-            cursor_y=cursor_y,
-            source_frame_id=frame_id,
-        )
-        self._app.receive_gesture(event)
+        last = self._last_emitted_at.get(gesture_type, -1e9)
+        return timestamp - last >= cooldown

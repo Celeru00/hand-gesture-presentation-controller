@@ -3,7 +3,7 @@ name = "hand-gesture-presentation-controller"
 version = "0.1.0"
 description = "Real-time hand gesture recognition system for controlling Microsoft PowerPoint"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "numpy",
     "Pillow",

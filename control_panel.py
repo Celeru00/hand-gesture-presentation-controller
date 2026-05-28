@@ -497,122 +497,200 @@ class PresentationControllerApp:
 
     def _build_ui(self) -> None:
         self.root.title("Hand Gesture Presentation Controller")
-        self.root.minsize(900, 650)
+        self.root.minsize(960, 600)
+        self.root.geometry("1180x720")
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("Gesture.TLabel", font=("Helvetica", 22, "bold"))
+        style.configure("Hint.TLabel", foreground="#666")
+        style.configure("Card.TLabelframe", padding=10)
+        style.configure("Card.TLabelframe.Label", font=("Helvetica", 11, "bold"))
+        style.configure("Toolbar.TFrame", padding=(0, 0, 0, 0))
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        main = ttk.Frame(self.root, padding=10)
+        main = ttk.Frame(self.root, padding=12)
         main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=0, minsize=320)
         main.rowconfigure(1, weight=1)
 
-        self._build_source_panel(main)
+        self._build_toolbar(main)
         self._build_video_panel(main)
         self._build_status_panel(main)
 
-    def _build_source_panel(self, parent: ttk.Frame) -> None:
-        source = ttk.LabelFrame(parent, text="Input source request")
-        source.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        source.columnconfigure(6, weight=1)
+    def _build_toolbar(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent, style="Toolbar.TFrame")
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
-        ttk.Label(source, text="Webcam index:").grid(
-            row=0, column=0, padx=(8, 4), pady=8,
+        ttk.Label(bar, text="Source", font=("Helvetica", 11, "bold")).pack(
+            side="left", padx=(0, 10),
         )
 
+        ttk.Label(bar, text="Cam").pack(side="left")
         tk.Spinbox(
-            source, from_=0, to=10, width=5, textvariable=self.webcam_index_var,
-        ).grid(row=0, column=1, padx=4, pady=8)
+            bar, from_=0, to=10, width=4, textvariable=self.webcam_index_var,
+        ).pack(side="left", padx=(4, 8))
 
-        ttk.Button(
-            source, text="Use webcam", command=self._request_webcam,
-        ).grid(row=0, column=2, padx=4, pady=8)
-
-        ttk.Button(
-            source, text="Choose video file", command=self._request_video_file,
-        ).grid(row=0, column=3, padx=4, pady=8)
-
-        ttk.Button(
-            source, text="Stop input", command=self._request_stop_input,
-        ).grid(row=0, column=4, padx=4, pady=8)
-
-        ttk.Label(source, textvariable=self.source_status_var).grid(
-            row=0, column=5, columnspan=2, padx=(16, 8), pady=8, sticky="w",
+        ttk.Button(bar, text="Use webcam", command=self._request_webcam).pack(
+            side="left", padx=2,
         )
+        ttk.Button(
+            bar, text="Choose video file", command=self._request_video_file,
+        ).pack(side="left", padx=2)
+        ttk.Button(bar, text="Stop", command=self._request_stop_input).pack(
+            side="left", padx=2,
+        )
+
+        ttk.Separator(bar, orient="vertical").pack(
+            side="left", fill="y", padx=12, pady=2,
+        )
+
+        ttk.Label(
+            bar, textvariable=self.source_status_var, style="Hint.TLabel",
+        ).pack(side="left")
 
     def _build_video_panel(self, parent: ttk.Frame) -> None:
-        video = ttk.LabelFrame(parent, text="Live feed from Dev 1")
-        video.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
-        video.columnconfigure(0, weight=1)
-        video.rowconfigure(0, weight=1)
+        container = ttk.LabelFrame(parent, text="Live feed", style="Card.TLabelframe")
+        container.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
 
-        self.video_label = ttk.Label(
-            video,
-            text="No frame received yet.",
-            anchor="center",
-            background="black",
-            foreground="white",
+        # The frame's size is driven by its grid cell, NOT by the image inside.
+        # grid_propagate(False) is what breaks the resize feedback loop.
+        self.video_frame = tk.Frame(container, background="#111")
+        self.video_frame.grid(row=0, column=0, sticky="nsew")
+        self.video_frame.grid_propagate(False)
+
+        self.video_label = tk.Label(
+            self.video_frame,
+            background="#111",
+            foreground="#bbb",
+            text="No feed yet.\nClick 'Use webcam' or 'Choose video file'.",
+            justify="center",
         )
-        self.video_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.video_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._video_w = 720
+        self._video_h = 480
+        self.video_frame.bind("<Configure>", self._on_video_frame_resized)
+
+    def _on_video_frame_resized(self, event: tk.Event) -> None:
+        self._video_w = max(160, event.width)
+        self._video_h = max(120, event.height)
 
     def _build_status_panel(self, parent: ttk.Frame) -> None:
-        status = ttk.LabelFrame(parent, text="Gesture and PowerPoint control")
-        status.grid(row=2, column=0, sticky="ew")
-        status.columnconfigure(1, weight=1)
-        status.columnconfigure(3, weight=1)
+        side = ttk.Frame(parent)
+        side.grid(row=1, column=1, sticky="nsew")
+        side.columnconfigure(0, weight=1)
 
-        ttk.Label(status, text="Current gesture:").grid(
-            row=0, column=0, padx=(8, 4), pady=6, sticky="w",
+        gesture_card = ttk.LabelFrame(
+            side, text="Current gesture", style="Card.TLabelframe",
         )
-        ttk.Label(status, textvariable=self.current_gesture_var).grid(
-            row=0, column=1, padx=4, pady=6, sticky="w",
-        )
-        ttk.Label(status, text="Confidence:").grid(
-            row=0, column=2, padx=(8, 4), pady=6, sticky="w",
-        )
-        ttk.Label(status, textvariable=self.current_confidence_var).grid(
-            row=0, column=3, padx=4, pady=6, sticky="w",
-        )
+        gesture_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        gesture_card.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            gesture_card,
+            textvariable=self.current_gesture_var,
+            style="Gesture.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+
+        conf_row = ttk.Frame(gesture_card)
+        conf_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        conf_row.columnconfigure(0, weight=1)
 
         ttk.Progressbar(
-            status, variable=self.confidence_percent_var, maximum=100.0,
-        ).grid(row=1, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="ew")
+            conf_row, variable=self.confidence_percent_var, maximum=100.0,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(conf_row, textvariable=self.current_confidence_var, width=5).grid(
+            row=0, column=1,
+        )
 
-        ttk.Label(status, text="Min confidence:").grid(
-            row=2, column=0, padx=(8, 4), pady=6, sticky="w",
+        controls_card = ttk.LabelFrame(
+            side, text="Control", style="Card.TLabelframe",
+        )
+        controls_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        controls_card.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            controls_card,
+            text="Enable PowerPoint control",
+            variable=self.control_enabled_var,
+        ).grid(row=0, column=0, sticky="w")
+
+        thr = ttk.Frame(controls_card)
+        thr.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        thr.columnconfigure(0, weight=1)
+        ttk.Label(thr, text="Min confidence").grid(
+            row=0, column=0, columnspan=2, sticky="w",
         )
         ttk.Scale(
-            status,
+            thr,
             from_=0.0,
             to=1.0,
             orient="horizontal",
             variable=self.confidence_threshold_var,
             command=self._on_threshold_changed,
-        ).grid(row=2, column=1, padx=4, pady=6, sticky="ew")
-        ttk.Label(status, textvariable=self.threshold_label_var, width=5).grid(
-            row=2, column=2, padx=4, pady=6, sticky="w",
-        )
-        ttk.Checkbutton(
-            status,
-            text="Enable PowerPoint control",
-            variable=self.control_enabled_var,
-        ).grid(row=2, column=3, padx=8, pady=6, sticky="w")
-
-        ttk.Label(status, text="Last action:").grid(
-            row=3, column=0, padx=(8, 4), pady=6, sticky="w",
-        )
-        ttk.Label(status, textvariable=self.last_action_var).grid(
-            row=3, column=1, columnspan=3, padx=4, pady=6, sticky="w",
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(2, 0))
+        ttk.Label(thr, textvariable=self.threshold_label_var, width=5).grid(
+            row=1, column=1, pady=(2, 0),
         )
 
+        btn_row = ttk.Frame(controls_card)
+        btn_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(
-            status,
+            btn_row,
             text="Release mouse",
             command=lambda: self.driver.release_draw_if_needed(force=True),
-        ).grid(row=4, column=0, padx=8, pady=(4, 8), sticky="w")
-        ttk.Button(
-            status, text="Clear status", command=self._clear_status,
-        ).grid(row=4, column=1, padx=4, pady=(4, 8), sticky="w")
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(btn_row, text="Clear status", command=self._clear_status).pack(
+            side="left",
+        )
+
+        action_card = ttk.LabelFrame(
+            side, text="Last action", style="Card.TLabelframe",
+        )
+        action_card.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        action_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            action_card,
+            textvariable=self.last_action_var,
+            wraplength=290,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+
+        cheat_card = ttk.LabelFrame(
+            side, text="Gesture reference", style="Card.TLabelframe",
+        )
+        cheat_card.grid(row=3, column=0, sticky="nsew")
+        side.rowconfigure(3, weight=1)
+        cheat_card.columnconfigure(1, weight=1)
+
+        cheat = [
+            ("Open palm", "Start (F5)"),
+            ("Closed fist", "Exit (Esc)"),
+            ("Thumbs up", "Blank (B)"),
+            ("Swipe right", "Next slide"),
+            ("Swipe left", "Previous slide"),
+            ("Index up", "Laser pointer"),
+            ("Peace sign", "Draw / annotate"),
+            ("Pinch open", "Zoom in"),
+            ("Pinch closed", "Zoom out"),
+        ]
+        for i, (pose, action) in enumerate(cheat):
+            ttk.Label(cheat_card, text=pose, style="Hint.TLabel").grid(
+                row=i, column=0, sticky="w", padx=(0, 12), pady=1,
+            )
+            ttk.Label(cheat_card, text=action).grid(
+                row=i, column=1, sticky="w", pady=1,
+            )
 
     # ------------------------------------------------------------------
     # Source selection: Dev 3 -> Dev 1
@@ -707,17 +785,23 @@ class PresentationControllerApp:
             self.last_action_var.set(f"Could not display frame: {exc}")
             return
 
-        label_w = max(320, self.video_label.winfo_width())
-        label_h = max(240, self.video_label.winfo_height())
+        target_w = self._video_w
+        target_h = self._video_h
+        img_w, img_h = pil_image.size
 
-        display_image = pil_image.copy()
+        if img_w <= 0 or img_h <= 0:
+            return
+
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w = max(1, int(img_w * scale))
+        new_h = max(1, int(img_h * scale))
 
         try:
             resample = Image.Resampling.LANCZOS
         except AttributeError:
             resample = Image.LANCZOS  # type: ignore
 
-        display_image.thumbnail((label_w, label_h), resample)
+        display_image = pil_image.resize((new_w, new_h), resample)
 
         self._latest_photo = ImageTk.PhotoImage(display_image)
         self.video_label.configure(image=self._latest_photo, text="")

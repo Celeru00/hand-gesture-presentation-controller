@@ -52,11 +52,10 @@ START_PRESENTATION = "start_presentation"
 STOP_EXIT = "stop_exit"
 BLANK_SCREEN = "blank_screen"
 LASER_POINTER = "laser_pointer"
-DRAW_ANNOTATE = "draw_annotate"
 ZOOM_IN = "zoom_in"
 ZOOM_OUT = "zoom_out"
 
-POINTER_GESTURES = {LASER_POINTER, DRAW_ANNOTATE}
+POINTER_GESTURES = {LASER_POINTER}
 
 GESTURE_LABELS = {
     NEXT_SLIDE: "Next slide",
@@ -65,7 +64,6 @@ GESTURE_LABELS = {
     STOP_EXIT: "Stop / exit",
     BLANK_SCREEN: "Blank screen",
     LASER_POINTER: "Laser pointer",
-    DRAW_ANNOTATE: "Draw / annotate",
     ZOOM_IN: "Zoom in",
     ZOOM_OUT: "Zoom out",
 }
@@ -88,11 +86,8 @@ class ControllerConfig:
     # Set True if your camera feed is mirrored and pointer movement feels reversed.
     mirror_cursor_x: bool = False
 
-    # Prevents the mouse from staying held down forever in draw mode.
-    draw_release_timeout_seconds: float = 0.25
-
-    # If no pointer/draw event arrives for this long, automatically press
-    # Esc to turn off PowerPoint's laser/pen mode.
+    # If no laser-pointer event arrives for this long, automatically press
+    # Esc to turn off PowerPoint's laser mode.
     pointer_idle_timeout_seconds: float = 0.5
 
     # Number of wheel "clicks" sent per zoom gesture. PowerPoint zoom uses
@@ -116,7 +111,6 @@ class ControllerConfig:
             ZOOM_IN: 0.25,
             ZOOM_OUT: 0.25,
             LASER_POINTER: 0.00,
-            DRAW_ANNOTATE: 0.00,
         }
     )
 
@@ -175,13 +169,6 @@ def normalize_gesture_name(name: str) -> str:
         "index_finger_only": LASER_POINTER,
         "index_only": LASER_POINTER,
         "pointing_up": LASER_POINTER,
-
-        "draw": DRAW_ANNOTATE,
-        "annotate": DRAW_ANNOTATE,
-        "draw_annotate": DRAW_ANNOTATE,
-        "peace": DRAW_ANNOTATE,
-        "peace_sign": DRAW_ANNOTATE,
-        "two_fingers": DRAW_ANNOTATE,
 
         "zoom_in": ZOOM_IN,
         "pinch_open": ZOOM_IN,
@@ -324,43 +311,19 @@ class PowerPointActionDriver:
             self._mouse_is_down = False
 
     def _handle_pointer_gesture(self, gesture: str, event: GestureEvent) -> str:
-        target_mode = "laser" if gesture == LASER_POINTER else "pen"
         label = GESTURE_LABELS[gesture]
 
-        # PowerPoint laser (Ctrl+L) and pen (Ctrl+P) are sticky toggles.
-        # If we're not in the right mode yet, send the shortcut once.
-        if self._active_pointer_mode != target_mode:
-            if self._active_pointer_mode is not None:
-                # Switching modes: turn the previous one off first.
-                self._exit_pointer_mode_if_any()
-            self._enter_pointer_mode(target_mode)
+        # PowerPoint's laser (Ctrl+L) is a sticky toggle.
+        if self._active_pointer_mode != "laser":
+            self._enter_pointer_mode("laser")
 
         coords = self._get_event_cursor(event)
-
         if coords is None:
-            if gesture == DRAW_ANNOTATE:
-                self.release_draw_if_needed(force=True)
             return f"Detected {label}, but no cursor_x/cursor_y was supplied."
 
         x, y = self._to_screen_xy(coords[0], coords[1])
-
-        if gesture == LASER_POINTER:
-            self.release_draw_if_needed(force=True)
-            pyautogui.moveTo(x, y, duration=0)
-            return f"Laser pointer at ({x}, {y})."
-
-        if gesture == DRAW_ANNOTATE:
-            if not self._mouse_is_down:
-                pyautogui.moveTo(x, y, duration=0)
-                pyautogui.mouseDown()
-                self._mouse_is_down = True
-            else:
-                pyautogui.moveTo(x, y, duration=0)
-
-            self._last_draw_event_at = time.time()
-            return f"Drawing at ({x}, {y})."
-
-        return f"No pointer action configured for {label}."
+        pyautogui.moveTo(x, y, duration=0)
+        return f"Laser pointer at ({x}, {y})."
 
     def _ctrl_scroll(self, direction: int) -> None:
         """Send Ctrl + mouse-wheel scroll. PowerPoint uses this for zoom in
@@ -376,19 +339,14 @@ class PowerPointActionDriver:
             pyautogui.keyUp("ctrl")
 
     def _enter_pointer_mode(self, mode: str) -> None:
-        """Toggle PowerPoint into laser or pen mode (Ctrl+L / Ctrl+P)."""
+        """Toggle PowerPoint into laser mode (Ctrl+L)."""
         if pyautogui is None:
             self._active_pointer_mode = mode
             return
 
         if mode == "laser":
             pyautogui.hotkey("ctrl", "l")
-        elif mode == "pen":
-            pyautogui.hotkey("ctrl", "p")
-        else:
-            return
-
-        self._active_pointer_mode = mode
+            self._active_pointer_mode = mode
 
     def _exit_pointer_mode_if_any(self) -> None:
         """Turn off laser/pen mode by pressing Esc, releasing the mouse first."""
@@ -752,7 +710,6 @@ class PresentationControllerApp:
             ("Swipe right", "Next slide (→)"),
             ("Swipe left", "Prev slide (←)"),
             ("Index up", "Laser (Ctrl+L)"),
-            ("Peace sign", "Draw (Ctrl+P)"),
             ("Pinch open", "Zoom in (Ctrl+scroll)"),
             ("Pinch closed", "Zoom out (Ctrl+scroll)"),
         ]

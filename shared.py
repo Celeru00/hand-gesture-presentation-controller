@@ -94,7 +94,7 @@ class GestureEvent:
 
     cursor_x / cursor_y:
         Optional. Normalized coordinates in [0.0, 1.0].
-        Only populated for LASER_POINTER and DRAW_ANNOTATE gestures.
+        Only populated for LASER_POINTER gestures.
         Dev 3 uses these to move the OS cursor.
 
     gesture_type accepted values (Dev 2 must use one of these strings,
@@ -102,7 +102,7 @@ class GestureEvent:
         "next_slide", "previous_slide",
         "start_presentation", "stop_exit",
         "blank_screen", "laser_pointer",
-        "draw_annotate", "zoom_in", "zoom_out"
+        "zoom_in", "zoom_out"
     """
 
     gesture_type: str

@@ -39,11 +39,10 @@ START_PRESENTATION = "start_presentation"
 STOP_EXIT = "stop_exit"
 BLANK_SCREEN = "blank_screen"
 LASER_POINTER = "laser_pointer"
-DRAW_ANNOTATE = "draw_annotate"
 ZOOM_IN = "zoom_in"
 ZOOM_OUT = "zoom_out"
 
-POINTER_GESTURES = {LASER_POINTER, DRAW_ANNOTATE}
+POINTER_GESTURES = {LASER_POINTER}
 
 DISCRETE_STATIC_GESTURES = {
     START_PRESENTATION,
@@ -113,11 +112,17 @@ class GestureRecognitionConfig:
     swipe_cooldown_seconds: float = 0.90
     mirror_swipe_x: bool = False
 
-    # Pinch zoom detection
-    pinch_closed_distance: float = 0.32
-    pinch_open_distance: float = 0.68
-    pinch_state_frames: int = 3
-    pinch_cooldown_seconds: float = 0.45
+    # Pinch zoom detection.
+    # The thresholds need clear separation: anything <= closed counts as a
+    # closed pinch, anything >= open counts as an open pinch. The wider the
+    # gap, the more deliberate the gesture must be.
+    pinch_closed_distance: float = 0.45
+    pinch_open_distance: float = 0.85
+    pinch_state_frames: int = 2
+    pinch_cooldown_seconds: float = 0.30
+    # Minimum "pinch-shape" score (other fingers folded, thumb+index active)
+    # required before either pinch state can be locked in.
+    pinch_shape_min_score: float = 0.40
 
     # Pointer smoothing
     pointer_filter_min_cutoff: float = 1.0
@@ -177,8 +182,6 @@ class HandFeatures:
 
     index_cursor_x: float
     index_cursor_y: float
-    draw_cursor_x: float
-    draw_cursor_y: float
 
 
 # ---------------------------------------------------------------------
@@ -474,7 +477,6 @@ class GestureRecognitionEngine:
         )
 
         index_tip = lms[HandLandmark.INDEX_TIP]
-        middle_tip = lms[HandLandmark.MIDDLE_TIP]
 
         return HandFeatures(
             landmarks=lms,
@@ -490,8 +492,6 @@ class GestureRecognitionEngine:
             pinch_distance=pinch_distance,
             index_cursor_x=index_tip.x,
             index_cursor_y=index_tip.y,
-            draw_cursor_x=(index_tip.x + middle_tip.x) / 2.0,
-            draw_cursor_y=(index_tip.y + middle_tip.y) / 2.0,
         )
 
     def _long_finger_extended_score(
@@ -515,7 +515,7 @@ class GestureRecognitionEngine:
         # Extended fingers usually have the tip farther from wrist than PIP.
         distance_score = self._score_range((tip_wrist - pip_wrist) / scale, 0.05, 0.45)
 
-        # For this project, index/peace/open palm are meant to face upward.
+        # For this project, index/open palm are meant to face upward.
         # In image coordinates, smaller y means higher on screen.
         vertical_score = self._score_range((pip.y - tip.y) / scale, 0.08, 0.55)
 
@@ -673,8 +673,8 @@ class GestureRecognitionEngine:
         )
 
         # When the thumb tip is close to the index tip, the hand is in a
-        # pinch shape — pinch detection should own those gestures, not the
-        # static classifier. Penalize laser/draw to prevent misclassification.
+        # pinch shape — pinch detection should own that gesture, not the
+        # static classifier. Penalize laser to prevent misclassification.
         not_pinching_score = self._score_range(f.pinch_distance, 0.70, 1.20)
 
         index_only_score = self._mean(
@@ -683,22 +683,6 @@ class GestureRecognitionEngine:
             fold["middle"],
             fold["ring"],
             fold["pinky"],
-            not_pinching_score,
-        )
-
-        peace_separation_score = self._score_range(
-            f.index_middle_separation,
-            0.25,
-            0.75,
-        )
-
-        peace_score = self._mean(
-            ext["index"],
-            ext["middle"],
-            fold["thumb"],
-            fold["ring"],
-            fold["pinky"],
-            peace_separation_score,
             not_pinching_score,
         )
 
@@ -724,13 +708,6 @@ class GestureRecognitionEngine:
                 cursor_x=f.index_cursor_x,
                 cursor_y=f.index_cursor_y,
                 metadata={"reason": "index finger only"},
-            ),
-            GestureCandidate(
-                gesture_type=DRAW_ANNOTATE,
-                confidence=peace_score,
-                cursor_x=f.draw_cursor_x,
-                cursor_y=f.draw_cursor_y,
-                metadata={"reason": "peace sign"},
             ),
         ]
 
@@ -995,7 +972,7 @@ class GestureRecognitionEngine:
             thumb_index_active,
         )
 
-        if pinch_shape_score < 0.55:
+        if pinch_shape_score < self.config.pinch_shape_min_score:
             state: Optional[str] = None
             confidence = 0.0
         elif features.pinch_distance <= self.config.pinch_closed_distance:
@@ -1005,8 +982,12 @@ class GestureRecognitionEngine:
                 self.config.pinch_closed_distance,
                 self.config.pinch_open_distance,
             )
+            # Floor at 0.55 so a clearly-detected pinch always passes the
+            # UI confidence threshold; scale up with how clear the pinch is.
             confidence = self._clamp01(
-                0.55 * distance_score + 0.45 * pinch_shape_score
+                0.55
+                + 0.25 * distance_score
+                + 0.20 * pinch_shape_score
             )
         elif features.pinch_distance >= self.config.pinch_open_distance:
             state = "open"
@@ -1016,7 +997,9 @@ class GestureRecognitionEngine:
                 self.config.pinch_open_distance,
             )
             confidence = self._clamp01(
-                0.55 * distance_score + 0.45 * pinch_shape_score
+                0.55
+                + 0.25 * distance_score
+                + 0.20 * pinch_shape_score
             )
         else:
             state = None

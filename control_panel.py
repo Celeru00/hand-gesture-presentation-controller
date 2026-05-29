@@ -73,7 +73,7 @@ GESTURE_LABELS = {
 
 @dataclass
 class ControllerConfig:
-    min_confidence: float = 0.75
+    min_confidence: float = 0.55
     enable_actions_on_start: bool = True
 
     frame_queue_size: int = 2
@@ -94,6 +94,10 @@ class ControllerConfig:
     # If no pointer/draw event arrives for this long, automatically press
     # Esc to turn off PowerPoint's laser/pen mode.
     pointer_idle_timeout_seconds: float = 0.5
+
+    # Number of wheel "clicks" sent per zoom gesture. PowerPoint zoom uses
+    # Ctrl + scroll. Larger values zoom in/out more aggressively per gesture.
+    zoom_scroll_clicks: int = 3
 
     # Optional. If installed:
     #   pip install pygetwindow
@@ -295,12 +299,12 @@ class PowerPointActionDriver:
             return "Sent B: blank / unblank screen."
 
         if gesture == ZOOM_IN:
-            pyautogui.hotkey("ctrl", "=")
-            return "Sent Ctrl + = : zoom in."
+            self._ctrl_scroll(direction=+1)
+            return "Sent Ctrl + scroll up: zoom in."
 
         if gesture == ZOOM_OUT:
-            pyautogui.hotkey("ctrl", "-")
-            return "Sent Ctrl + - : zoom out."
+            self._ctrl_scroll(direction=-1)
+            return "Sent Ctrl + scroll down: zoom out."
 
         return f"No action configured for {label}."
 
@@ -357,6 +361,19 @@ class PowerPointActionDriver:
             return f"Drawing at ({x}, {y})."
 
         return f"No pointer action configured for {label}."
+
+    def _ctrl_scroll(self, direction: int) -> None:
+        """Send Ctrl + mouse-wheel scroll. PowerPoint uses this for zoom in
+        both edit mode and slideshow mode, unlike Ctrl + = which only works
+        in edit mode."""
+        if pyautogui is None:
+            return
+        amount = self.config.zoom_scroll_clicks * (1 if direction > 0 else -1)
+        pyautogui.keyDown("ctrl")
+        try:
+            pyautogui.scroll(amount)
+        finally:
+            pyautogui.keyUp("ctrl")
 
     def _enter_pointer_mode(self, mode: str) -> None:
         """Toggle PowerPoint into laser or pen mode (Ctrl+L / Ctrl+P)."""
@@ -736,8 +753,8 @@ class PresentationControllerApp:
             ("Swipe left", "Prev slide (←)"),
             ("Index up", "Laser (Ctrl+L)"),
             ("Peace sign", "Draw (Ctrl+P)"),
-            ("Pinch open", "Zoom in (Ctrl+=)"),
-            ("Pinch closed", "Zoom out (Ctrl+-)"),
+            ("Pinch open", "Zoom in (Ctrl+scroll)"),
+            ("Pinch closed", "Zoom out (Ctrl+scroll)"),
         ]
         for i, (pose, action) in enumerate(cheat):
             ttk.Label(cheat_card, text=pose, style="Hint.TLabel").grid(

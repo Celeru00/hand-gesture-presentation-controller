@@ -100,7 +100,7 @@ class GestureRecognitionConfig:
     """
 
     # Static gesture confirmation
-    min_static_confidence: float = 0.72
+    min_static_confidence: float = 0.62
     stable_frames: int = 5
     stable_ratio: float = 0.70
     unstable_reset_frames: int = 4
@@ -645,7 +645,7 @@ class GestureRecognitionEngine:
         ext = f.finger_extended
         fold = f.finger_folded
 
-        open_spread_score = self._score_range(f.index_pinky_separation, 1.20, 2.20)
+        open_spread_score = self._score_range(f.index_pinky_separation, 0.80, 1.80)
 
         open_palm_score = self._mean(
             ext["thumb"],
@@ -672,12 +672,18 @@ class GestureRecognitionEngine:
             fold["pinky"],
         )
 
+        # When the thumb tip is close to the index tip, the hand is in a
+        # pinch shape — pinch detection should own those gestures, not the
+        # static classifier. Penalize laser/draw to prevent misclassification.
+        not_pinching_score = self._score_range(f.pinch_distance, 0.70, 1.20)
+
         index_only_score = self._mean(
             ext["index"],
             fold["thumb"],
             fold["middle"],
             fold["ring"],
             fold["pinky"],
+            not_pinching_score,
         )
 
         peace_separation_score = self._score_range(
@@ -693,6 +699,7 @@ class GestureRecognitionEngine:
             fold["ring"],
             fold["pinky"],
             peace_separation_score,
+            not_pinching_score,
         )
 
         candidates = [
@@ -932,10 +939,14 @@ class GestureRecognitionEngine:
             self.config.swipe_max_dy,
         )
 
+        # Base 0.50 floor so any swipe that passes the gate has meaningful
+        # confidence. Without this, a swipe that barely clears the minimum
+        # displacement/velocity scores ~0.15 and gets filtered by the UI.
         confidence = self._clamp01(
-            0.45 * displacement_score
-            + 0.40 * velocity_score
-            + 0.15 * vertical_penalty
+            0.50
+            + 0.20 * displacement_score
+            + 0.20 * velocity_score
+            + 0.10 * vertical_penalty
         )
 
         self._last_emitted_at[gesture] = packet.timestamp

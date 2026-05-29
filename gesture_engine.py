@@ -110,19 +110,27 @@ class GestureRecognitionConfig:
     swipe_max_dy: float = 0.14
     swipe_min_velocity: float = 0.55
     swipe_cooldown_seconds: float = 0.90
-    mirror_swipe_x: bool = False
+    # The webcam feed is mirrored (you see yourself like a mirror), so when
+    # the user physically swipes to their right, the hand in the image moves
+    # to the LEFT. Mirroring dx makes the gesture map to the natural direction:
+    # physical-right swipe → next slide, physical-left swipe → previous slide.
+    mirror_swipe_x: bool = True
 
-    # Pinch zoom detection.
-    # The thresholds need clear separation: anything <= closed counts as a
-    # closed pinch, anything >= open counts as an open pinch. The wider the
-    # gap, the more deliberate the gesture must be.
-    pinch_closed_distance: float = 0.45
-    pinch_open_distance: float = 0.85
-    pinch_state_frames: int = 2
-    pinch_cooldown_seconds: float = 0.30
-    # Minimum "pinch-shape" score (other fingers folded, thumb+index active)
-    # required before either pinch state can be locked in.
-    pinch_shape_min_score: float = 0.40
+    # Pinch zoom detection — step-based.
+    # We track the thumb-index distance and fire a zoom event each time it
+    # changes by pinch_step_distance from the last baseline. This lets the
+    # user keep zooming in by repeatedly spreading their fingers, without
+    # having to alternate closed/open like the old transition model.
+    pinch_step_distance: float = 0.30
+    pinch_cooldown_seconds: float = 0.20
+    # Minimum "pinch-shape" score required to start tracking. Lower = more
+    # forgiving (engages with looser hand poses).
+    pinch_shape_min_score: float = 0.45
+    # After firing a zoom, opposite-direction firing is suppressed for this
+    # long. Lets the user "reset" their hand position by closing fingers
+    # without accidentally firing zoom_out between zoom_ins. Suppression
+    # auto-refreshes while reverse motion is active.
+    pinch_reverse_suppression_seconds: float = 0.6
 
     # Pointer smoothing
     pointer_filter_min_cutoff: float = 1.0
@@ -296,10 +304,10 @@ class GestureRecognitionEngine:
         self._motion_history: Deque[Tuple[float, float, float]] = deque()
         self._last_emitted_at: Dict[str, float] = {}
 
-        self._pinch_window: Deque[Tuple[Optional[str], float]] = deque(
-            maxlen=self.config.pinch_state_frames
-        )
-        self._stable_pinch_state: Optional[str] = None
+        # Step-based pinch tracking
+        self._pinch_baseline_distance: Optional[float] = None
+        self._last_pinch_gesture: Optional[str] = None
+        self._pinch_reverse_until: float = 0.0
 
         self._pointer_x_filter = OneEuroFilter(
             min_cutoff=self.config.pointer_filter_min_cutoff,
@@ -379,8 +387,9 @@ class GestureRecognitionEngine:
 
         self._reset_static_stability()
         self._motion_history.clear()
-        self._pinch_window.clear()
-        self._stable_pinch_state = None
+        self._pinch_baseline_distance = None
+        self._last_pinch_gesture = None
+        self._pinch_reverse_until = 0.0
         self._pointer_x_filter.reset()
         self._pointer_y_filter.reset()
 
@@ -953,6 +962,15 @@ class GestureRecognitionEngine:
         packet: LandmarkPacket,
         features: HandFeatures,
     ) -> Optional[GestureEvent]:
+        """Step-based pinch zoom.
+
+        Track the thumb-index distance. Each time it shifts by
+        pinch_step_distance from the last baseline, fire a zoom event in
+        the direction of the shift. After firing, opposite-direction events
+        are suppressed for a short window so the user can reset their hand
+        position (e.g., close fingers to spread again for another zoom in)
+        without accidentally triggering the reverse zoom.
+        """
         fold = features.finger_folded
         ext = features.finger_extended
 
@@ -962,9 +980,12 @@ class GestureRecognitionEngine:
             fold["pinky"],
         )
 
+        # Stricter than before: require index to be EXTENDED (not just
+        # "not folded"). Prevents thumbs-up and similar poses from passing
+        # the pinch-shape gate.
         thumb_index_active = self._mean(
             max(features.thumb_open_score, features.thumb_up_score),
-            max(ext["index"], 1.0 - fold["index"]),
+            ext["index"],
         )
 
         pinch_shape_score = self._mean(
@@ -972,75 +993,39 @@ class GestureRecognitionEngine:
             thumb_index_active,
         )
 
+        # Not in pinch shape → clear baseline; no zoom this frame.
         if pinch_shape_score < self.config.pinch_shape_min_score:
-            state: Optional[str] = None
-            confidence = 0.0
-        elif features.pinch_distance <= self.config.pinch_closed_distance:
-            state = "closed"
-            distance_score = 1.0 - self._score_range(
-                features.pinch_distance,
-                self.config.pinch_closed_distance,
-                self.config.pinch_open_distance,
-            )
-            # Floor at 0.55 so a clearly-detected pinch always passes the
-            # UI confidence threshold; scale up with how clear the pinch is.
-            confidence = self._clamp01(
-                0.55
-                + 0.25 * distance_score
-                + 0.20 * pinch_shape_score
-            )
-        elif features.pinch_distance >= self.config.pinch_open_distance:
-            state = "open"
-            distance_score = self._score_range(
-                features.pinch_distance,
-                self.config.pinch_closed_distance,
-                self.config.pinch_open_distance,
-            )
-            confidence = self._clamp01(
-                0.55
-                + 0.25 * distance_score
-                + 0.20 * pinch_shape_score
-            )
-        else:
-            state = None
-            confidence = 0.0
-
-        self._pinch_window.append((state, confidence))
-
-        if len(self._pinch_window) < self.config.pinch_state_frames:
+            self._pinch_baseline_distance = None
             return None
 
-        states = [s for s, _ in self._pinch_window]
-        state_counts = Counter(states)
-        stable_state, count = state_counts.most_common(1)[0]
+        current_distance = features.pinch_distance
 
-        if stable_state is None:
-            if count == len(self._pinch_window):
-                self._stable_pinch_state = None
+        # First frame of a fresh pinch session — establish baseline only.
+        if self._pinch_baseline_distance is None:
+            self._pinch_baseline_distance = current_distance
             return None
 
-        if count < self.config.pinch_state_frames:
+        delta = current_distance - self._pinch_baseline_distance
+
+        # Haven't moved enough since last fire/baseline; wait for more.
+        if abs(delta) < self.config.pinch_step_distance:
             return None
 
-        average_confidence = self._mean(
-            *(conf for s, conf in self._pinch_window if s == stable_state)
+        gesture = ZOOM_IN if delta > 0 else ZOOM_OUT
+
+        # Suppress reverse-direction firing while the user is "resetting"
+        # their hand after a recent zoom. Refresh the suppression window
+        # on every reverse-motion frame so a slow reset can't slip through.
+        is_reverse = (
+            self._last_pinch_gesture is not None
+            and gesture != self._last_pinch_gesture
         )
-
-        previous_state = self._stable_pinch_state
-
-        if previous_state == stable_state:
-            return None
-
-        self._stable_pinch_state = stable_state
-
-        if previous_state is None:
-            return None
-
-        if previous_state == "closed" and stable_state == "open":
-            gesture = ZOOM_IN
-        elif previous_state == "open" and stable_state == "closed":
-            gesture = ZOOM_OUT
-        else:
+        if is_reverse and packet.timestamp < self._pinch_reverse_until:
+            self._pinch_baseline_distance = current_distance
+            self._pinch_reverse_until = (
+                packet.timestamp
+                + self.config.pinch_reverse_suppression_seconds
+            )
             return None
 
         if not self._cooldown_ok(
@@ -1050,18 +1035,35 @@ class GestureRecognitionEngine:
         ):
             return None
 
+        # Commit the fire.
         self._last_emitted_at[gesture] = packet.timestamp
+        self._last_pinch_gesture = gesture
+        self._pinch_reverse_until = (
+            packet.timestamp + self.config.pinch_reverse_suppression_seconds
+        )
+        self._pinch_baseline_distance = current_distance
+
+        step_score = self._score_range(
+            abs(delta),
+            self.config.pinch_step_distance,
+            self.config.pinch_step_distance * 2.0,
+        )
+        confidence = self._clamp01(
+            0.55
+            + 0.25 * step_score
+            + 0.20 * pinch_shape_score
+        )
 
         return GestureEvent(
             gesture_type=gesture,
-            confidence=average_confidence,
+            confidence=confidence,
             timestamp=packet.timestamp,
             source_frame_id=packet.frame_id,
             metadata={
-                "reason": "pinch transition",
-                "previous_pinch_state": previous_state,
-                "current_pinch_state": stable_state,
-                "pinch_distance": features.pinch_distance,
+                "reason": "pinch step",
+                "delta": delta,
+                "current_distance": current_distance,
+                "pinch_shape_score": pinch_shape_score,
             },
         )
 

@@ -1,8 +1,4 @@
 """
-person2_gesture_engine/gesture_engine.py
-
-Person 2 — Gesture Recognition Engine
-
 Responsibilities:
 - Receive 21 hand landmarks from Person 1.
 - Classify the hand shape or movement into a known gesture.
@@ -26,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
-from shared import GestureEvent, LandmarkPacket, LandmarkPoint
+from .shared import GestureEvent, LandmarkPacket, LandmarkPoint
 
 
 # ---------------------------------------------------------------------

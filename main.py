@@ -10,9 +10,9 @@ Run with:
     uv run main.py
 """
 
-from control_panel import PresentationControllerApp
-from gesture_engine import GestureRecognitionEngine
-from vision_engine import VisionEngine
+from engines.control_panel import PresentationControllerApp
+from engines.gesture_engine import GestureRecognitionEngine
+from engines.vision_engine import VisionEngine
 
 
 def main() -> None:

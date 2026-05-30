@@ -1,8 +1,4 @@
 """
-vision_engine.py
-================
-Dev 1 — Computer Vision Engine
-
 Responsibilities:
 - Open webcam or video file as requested by Dev 3 via SourceRequest.
 - Run MediaPipe Hands on each frame to detect hand landmarks.
@@ -35,7 +31,7 @@ from typing import Any, Optional, Union
 import cv2
 import mediapipe as mp
 
-from shared import FramePacket, LandmarkPacket, LandmarkPoint, SourceRequest
+from .shared import FramePacket, LandmarkPacket, LandmarkPoint, SourceRequest
 
 
 class VisionEngine:
